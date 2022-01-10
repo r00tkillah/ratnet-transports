@@ -16,11 +16,16 @@ import (
 	"github.com/awgh/ratnet/api/events"
 )
 
-// MTU - the effective MTU inside the DNS tunnel
-const MTU = 150
+const (
+	// defaultMTU - the effective defaultMTU inside the DNS tunnel (defaults to ((5/8) * 253) - 8 or 148.86) //FIXME: WTF
+	defaultMTU = 150
 
-// MaxMsgSize - the maximum size of a single message
-const MaxMsgSize = 2889
+	// maxMsgSize - the maximum size of a single message
+	maxMsgSize = 2889
+
+	clientTimeout = 4 * time.Second
+	serverTimeout = 3 * time.Second
+)
 
 func init() {
 	ratnet.Transports["dns"] = NewFromMap // register this module by name (for deserialization support)
@@ -31,6 +36,9 @@ type Module struct {
 	node                             api.Node
 	isRunningClient, isRunningServer uint32
 	byteLimit                        int64
+
+	// domain is a domain that we are quering
+	domain string
 
 	ListenStr, UpstreamStr string
 	ClientConv, ServerConv uint32
@@ -53,6 +61,7 @@ type Module struct {
 	// mutexes
 	clientMutex sync.Mutex
 	serverMutex sync.Mutex
+	rwMutex     sync.RWMutex
 }
 
 // NewFromMap : Makes a new instance of this transport module from a map of arguments (for deserialization support)
@@ -61,6 +70,7 @@ func NewFromMap(node api.Node, t map[string]interface{}) api.Transport {
 	upstreamStr := ""
 	clientConv := uint32(0xFFFFFFFF)
 	serverConv := uint32(0xFFFFFFFF)
+	domain := ""
 	if _, ok := t["ListenStr"]; ok {
 		listenStr = t["ListenStr"].(string)
 	}
@@ -68,15 +78,19 @@ func NewFromMap(node api.Node, t map[string]interface{}) api.Transport {
 		upstreamStr = t["UpstreamStr"].(string)
 	}
 	if _, ok := t["ClientConv"]; ok {
-		clientConv = t["ClientConv"].(uint32)
+		clientConv, _ = uint32FromMap(t, "ClientConv")
 	}
 	if _, ok := t["ServerConv"]; ok {
-		serverConv = t["ServerConv"].(uint32)
+		serverConv, _ = uint32FromMap(t, "ServerConv")
+	}
+	if _, ok := t["Domain"]; ok {
+		domain = t["Domain"].(string)
 	}
 
 	instance := New(node, clientConv, serverConv)
 	instance.UpstreamStr = upstreamStr
 	instance.ListenStr = listenStr
+	instance.domain = domain
 
 	return instance
 }
@@ -86,16 +100,16 @@ func New(node api.Node, clientConv uint32, serverConv uint32) *Module {
 	instance := new(Module)
 	instance.node = node
 
-	clientConv = uint32(0xFFFFFFFF)
-	serverConv = uint32(0xFFFFFFFF)
-
 	instance.ClientConv = clientConv
 	instance.ServerConv = serverConv
 
-	instance.respchan = make(chan api.RemoteResponse, 200)
+	// size of for all channels created
+	channelSize := 200
 
-	instance.upstreamKCPData = make(chan []byte, 200)
-	instance.downstreamKCPData = make(chan []byte, 200)
+	instance.respchan = make(chan api.RemoteResponse, channelSize)
+
+	instance.upstreamKCPData = make(chan []byte, channelSize)
+	instance.downstreamKCPData = make(chan []byte, channelSize)
 
 	// Client is for client connections (from me) and server responses (from remote)
 	// Server is for server connections (from remote) and my responses (from me)
@@ -121,7 +135,12 @@ func (m *Module) Name() string {
 // MarshalJSON : Create a serialied representation of the config of this module
 func (m *Module) MarshalJSON() (b []byte, e error) {
 	return json.Marshal(map[string]interface{}{
-		"Transport": "dns",
+		"Transport":   "dns",
+		"ListenStr":   m.ListenStr,
+		"UpstreamStr": m.UpstreamStr,
+		"ClientConv":  m.ClientConv,
+		"ServerConv":  m.ServerConv,
+		"Domain":      m.Domain,
 	})
 }
 
@@ -133,21 +152,45 @@ func (m *Module) SetByteLimit(limit int64) { m.byteLimit = limit }
 
 // Listen : opens a UDP socket and listens
 func (m *Module) Listen(listen string, adminMode bool) {
+	events.Info(m.node, "listen")
 	m.ListenStr = listen
 	m.adminMode = adminMode
-	// go serve("tcp", listen)
 	go m.serve("udp", listen, adminMode)
 }
 
 // Stop : Stops module
 func (m *Module) Stop() {
-	// m.stopClient()
 	m.stopServer()
+}
+
+// Domain gets the domain set for this transport
+func (m *Module) Domain() string {
+	m.rwMutex.RLock()
+	defer m.rwMutex.RUnlock()
+	return m.domain
+}
+
+// SetDomain gets the domain for this transport
+func (m *Module) SetDomain(domain string) {
+	m.rwMutex.Lock()
+	defer m.rwMutex.Unlock()
+	m.domain = domain
+}
+
+// MTU returns the maximum transmission unit (MTU) for this transport
+func (m *Module) MTU() int {
+	mtu := defaultMTU
+	if m.Domain() != "" {
+		mtu -= len(m.Domain()) + 1 //to accommodate the dot
+
+	}
+	return defaultMTU
 }
 
 // Private / Internal Methods
 
 func (m *Module) serve(net, addr string, adminMode bool) {
+	events.Info(m.node, "serve")
 	m.kcpServer = kcp.NewKCP(m.ServerConv,
 		func(buf []byte, size int) {
 			if size > 0 {
@@ -157,7 +200,7 @@ func (m *Module) serve(net, addr string, adminMode bool) {
 
 			}
 		})
-	m.kcpServer.SetMtu(MTU) // ((5/8) * 253) -8
+	m.kcpServer.SetMtu(m.MTU())
 	// NoDelay options
 	// fastest: ikcp_nodelay(kcp, 1, 20, 2, 1)
 	// nodelay: 0:disable(default), 1:enable
@@ -174,11 +217,6 @@ func (m *Module) serve(net, addr string, adminMode bool) {
 		defer m.wgServer.Done()
 
 		for m.IsRunningServer() {
-			// m.serverMutex.Lock()
-			// delay := m.kcpServer.Check()
-			// m.serverMutex.Unlock()
-			// time.Sleep(time.Duration(delay) * time.Millisecond)
-
 			time.Sleep(time.Millisecond * 15)
 			m.serverMutex.Lock()
 			m.kcpServer.Update()
@@ -219,8 +257,7 @@ func (m *Module) initClient() {
 
 					}
 				})
-			kcpClient.SetMtu(MTU) // ((5/8) * 253) -8
-			// instance.kcpClient.NoDelay(1, 20, 2, 1)
+			kcpClient.SetMtu(m.MTU())
 			kcpClient.NoDelay(0, 20, 0, 1)
 			m.clientMutex.Lock()
 			m.kcpClient = kcpClient
@@ -241,15 +278,10 @@ func (m *Module) startClient() {
 
 		m.setIsRunningClient(true)
 
+		m.wgClient.Add(1)
 		go func() {
-			m.wgClient.Add(1)
 			defer m.wgClient.Done()
 			for m.IsRunningClient() {
-				// m.clientMutex.Lock()
-				// delay := m.kcpClient.Check()
-				// m.clientMutex.Unlock()
-				// time.Sleep(time.Duration(delay) * time.Millisecond)
-
 				time.Sleep(time.Millisecond * 15)
 				m.clientMutex.Lock()
 				m.kcpClient.Update()
@@ -257,8 +289,9 @@ func (m *Module) startClient() {
 			}
 			events.Info(m.node, "Client Update Loop Stopped")
 		}()
+
+		m.wgClient.Add(1)
 		go func() {
-			m.wgClient.Add(1)
 			defer m.wgClient.Done()
 			for m.IsRunningClient() {
 				m.feedUpstream(true)
@@ -319,4 +352,16 @@ func (m *Module) setIsRunningServer(b bool) {
 		running = 1
 	}
 	atomic.StoreUint32(&m.isRunningServer, running)
+}
+
+// uint32FromMap is a convenience function for json deserialization
+func uint32FromMap(t map[string]interface{}, key string) (result uint32, ok bool) {
+	if _, ok := t[key]; ok {
+		if i, ok := t[key].(float64); ok {
+			result = uint32(i)
+		} else {
+			result = t[key].(uint32)
+		}
+	}
+	return
 }

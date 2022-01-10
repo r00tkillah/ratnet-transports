@@ -3,6 +3,7 @@ package dns
 import (
 	"encoding/base32"
 	"errors"
+	"strings"
 )
 
 //
@@ -55,4 +56,21 @@ func Undotify(data string) ([]byte, error) {
 		return nil, err
 	}
 	return outbytes, nil
+}
+
+// RemoveDomain is a simple utility function for removing domain from a dotified string/fqdn
+func RemoveDomain(domain string, input string) string {
+	if domain == "" {
+		return input
+	}
+	suffix := domain + "."
+	return strings.TrimSuffix(input, suffix)
+}
+
+// AddDomain is a simple utility function for adding a domain to a dotified string/subdomain
+func AddDomain(domain string, input string) string {
+	if domain == "" {
+		return input
+	}
+	return input + domain + "."
 }

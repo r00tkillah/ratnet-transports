@@ -49,3 +49,81 @@ func Test_Dotify_Undotify_2(t *testing.T) {
 		t.Error("Equality check failed: ", badbytes, len(badbytes), undot, len(undot))
 	}
 }
+
+func Test_Add_RemoveDomainAGAIN(t *testing.T) {
+	type testCase struct {
+		domain    string
+		subdomain string
+		fqdn      string
+	}
+	testCases := []testCase{
+		{
+			"",
+			"",
+			"",
+		},
+		{
+			"",
+			"subdomain.",
+			"subdomain.",
+		},
+		{
+			"domain",
+			"subdomain.",
+			"subdomain.domain.",
+		},
+		{
+			"domain.tld",
+			"subdomain.",
+			"subdomain.domain.tld.",
+		},
+		{
+			"domain.tld",
+			"subsubdomain.subdomain.",
+			"subsubdomain.subdomain.domain.tld.",
+		},
+	}
+
+	for _, tc := range testCases {
+		fqdn := dns.AddDomain(tc.domain, tc.subdomain)
+		if fqdn != tc.fqdn {
+			t.Error("Equality check failed:", fqdn, tc.fqdn)
+		}
+		subdomain := dns.RemoveDomain(tc.domain, fqdn)
+		if subdomain != tc.subdomain {
+			t.Error("Equality check failed:", subdomain, tc.subdomain)
+		}
+	}
+}
+
+func Test_Dotify_Undotify_AddRemoveDoamin(t *testing.T) {
+	domain := "test.tld"
+	max := 151 - (len(domain) + 1)
+
+	for i := 0; i < max; i++ {
+		testcase, err := bc.GenerateRandomBytes(i)
+		if err != nil {
+			t.Error(err.Error())
+		}
+
+		dot, err := dns.Dotify(testcase)
+		if err != nil {
+			t.Error(err.Error())
+		}
+		fqdn := dns.AddDomain(domain, dot)
+		subdomain := dns.RemoveDomain(domain, fqdn)
+
+		if subdomain != dot {
+			t.Error("Equality check failed:", subdomain, dot)
+		}
+
+		undot, err := dns.Undotify(subdomain)
+		if err != nil {
+			t.Error(err.Error())
+		}
+
+		if !bytes.Equal(testcase, undot) {
+			t.Error("Equality check failed: ", testcase, len(testcase), undot, len(undot))
+		}
+	}
+}

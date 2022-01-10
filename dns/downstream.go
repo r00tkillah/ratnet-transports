@@ -36,7 +36,8 @@ func (m *Module) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 			continue
 		}
 		// undotify then base32 decode
-		data, err := Undotify(req.Question[i].Name)
+		b32s := RemoveDomain(m.Domain(), req.Question[i].Name)
+		data, err := Undotify(b32s)
 		if err != nil {
 			events.Error(m.node, "handleDNS error:", err)
 		} else {
@@ -49,7 +50,7 @@ func (m *Module) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 
 	// scrub out the original name to save space, matching transaction ID is all you need anyway
 	msg.Question = make([]mdns.Question, 1)
-	msg.Question[0] = mdns.Question{Name: "mail.", Qtype: req.Question[0].Qtype, Qclass: mdns.ClassINET}
+	msg.Question[0] = mdns.Question{Name: "mail." + m.Domain(), Qtype: req.Question[0].Qtype, Qclass: mdns.ClassINET}
 
 	// fetch outbound data from kcp and load into response
 	var answers []mdns.RR
@@ -57,7 +58,6 @@ func (m *Module) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 
 	select {
 	case item = <-m.downstreamKCPData:
-
 		// base32 encode, then dotify / "DNS chop"
 		b32s, err := Dotify(item)
 		if err != nil {
@@ -65,16 +65,17 @@ func (m *Module) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 			return
 		}
 		rr := new(mdns.A)
-		rr.Hdr = mdns.RR_Header{Name: b32s, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0}
+		fqdn := AddDomain(m.Domain(), b32s)
+		rr.Hdr = mdns.RR_Header{Name: fqdn, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0}
 		rr.A = net.ParseIP("192.168.1.1") // todo: this should be data
 		answers = append(answers, rr)
 		break
-	case <-time.After(ServerTimeout): // nothing's ready to go, send empty response
+	case <-time.After(serverTimeout): // nothing's ready to go, send empty response
 		// no answer, nothing to send
 	}
 	msg.Answer = answers
 
-	maxItemSize := math.Ceil(1.6*float64(MTU)) + 15 // base32 overhead plus 15 bytes per-answer overhead
+	maxItemSize := math.Ceil(1.6*float64(m.MTU())) + 15 // base32 overhead plus 15 bytes per-answer overhead
 	ok := true
 	// opportunistically grab up to 10 more, without exceeding max DNS message length of 512
 	// practically speaking, this will usually only grab up 1 or 2 more
@@ -93,7 +94,8 @@ func (m *Module) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 				return
 			}
 			rr := new(mdns.A)
-			rr.Hdr = mdns.RR_Header{Name: b32s, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0}
+			fqdn := AddDomain(m.Domain(), b32s)
+			rr.Hdr = mdns.RR_Header{Name: fqdn, Rrtype: mdns.TypeA, Class: mdns.ClassINET, Ttl: 0}
 			rr.A = net.ParseIP("192.168.1.1") // todo: this should be data
 			answers = append(answers, rr)
 		default:
@@ -110,7 +112,7 @@ func (m *Module) handleDNS(w mdns.ResponseWriter, req *mdns.Msg) {
 
 // pulls from kcpServer (userdata), passes to node, responses to kcpServer (userdata)
 func (m *Module) serverUpdate() {
-	buffer := make([]byte, MaxMsgSize)
+	buffer := make([]byte, maxMsgSize)
 	m.serverMutex.Lock()
 	n := m.kcpServer.Recv(buffer)
 	m.serverMutex.Unlock()
@@ -143,6 +145,7 @@ func (m *Module) serverUpdate() {
 		}
 
 		events.Info(m.node, fmt.Sprintf("serverUpdate returned Error: %s, Value: %+v", rr.Error, rr.Value))
+
 		outb := api.RemoteResponseToBytes(&rr)
 
 		m.serverMutex.Lock()

@@ -32,35 +32,44 @@ func (m *Module) feedUpstream(sendEmpty bool) bool {
 			events.Error(m.node, err)
 			return false
 		}
-		req.SetQuestion(b32s, mdns.TypeCNAME)
+		fqdn := AddDomain(m.Domain(), b32s)
+		events.Info(m.node, "fqdn: ", fqdn)
+		req.SetQuestion(fqdn, mdns.TypeCNAME)
 	default:
 		if !sendEmpty {
 			return false
 		}
-		req.SetQuestion("mail.", mdns.TypeMX) // send no data, just get response
+		fqdn := AddDomain(m.Domain(), "mail.")
+		req.SetQuestion(fqdn, mdns.TypeMX) // send no data, just get response
 	}
 
 	req.RecursionDesired = true
 	// req.Compress = true
 
-	dnsClient := &mdns.Client{Net: "udp", ReadTimeout: ClientTimeout, WriteTimeout: ClientTimeout, SingleInflight: true}
+	dnsClient := &mdns.Client{Net: "udp", ReadTimeout: clientTimeout, WriteTimeout: clientTimeout, SingleInflight: true}
+
+	// BEGIN FIXME: this is just sketching out the logic and needs to be extraced elsewhere
+
+	//upstream := m.UpstreamStr
+	events.Info(m.node, fmt.Sprintf("upstream: '%s'", m.UpstreamStr))
 	r, _, err := dnsClient.Exchange(req, m.UpstreamStr)
+	// END FIXME:
+
 	if err == nil {
 		for _, value := range r.Answer {
-			bufd, errb := Undotify(value.Header().Name)
+			domain := RemoveDomain(m.Domain(), value.Header().Name)
+			bufd, errb := Undotify(domain)
 			if errb != nil {
 				events.Warning(m.node, errb)
 				return false
 			}
-			events.Info(m.node, "feedUpstream sending", string(bufd))
-
+			events.Info(m.node, "feedUpstream sending", bufd)
 			m.clientMutex.Lock()
 			m.kcpClient.Input(bufd, true, false)
 			m.clientMutex.Unlock()
 		}
 	} else {
 		events.Warning(m.node, "DNS exchange failed in feedUpstream: ", m.UpstreamStr, err.Error())
-		// m.stopClient()
 	}
 
 	m.debouncerClientUpdate.Trigger()
@@ -69,7 +78,7 @@ func (m *Module) feedUpstream(sendEmpty bool) bool {
 
 // pulls from kcpClient (user data received) and pushes to client responses channel
 func (m *Module) clientUpdate() {
-	buffer := make([]byte, MaxMsgSize)
+	buffer := make([]byte, maxMsgSize)
 	m.clientMutex.Lock()
 	n := m.kcpClient.Recv(buffer)
 	m.clientMutex.Unlock()
